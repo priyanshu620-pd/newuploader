@@ -1,25 +1,41 @@
+import asyncio
+import concurrent.futures
+import datetime
+import logging
+import mmap
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
-import mmap
-import datetime
-import aiohttp
+import urllib.parse
+import zipfile
+from base64 import b64decode
+from io import BytesIO
+from math import ceil
+from pathlib import Path
+from urllib.parse import urljoin
+
 import aiofiles
-import asyncio
-import logging
+import aiohttp
 import requests
 import tgcrypto
-import subprocess
-import concurrent.futures
-from math import ceil
-from utils import progress_bar
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from io import BytesIO
-from pathlib import Path  
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-from base64 import b64decode
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from requests.adapters import HTTPAdapter
+from tqdm import tqdm
+from urllib3.util.retry import Retry
+from utils import progress_bar
+
+failed_counter = 0
+
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+
 
 def duration(filename):
     if not Path(filename).exists():
@@ -27,11 +43,20 @@ def duration(filename):
         return 0.0
 
     try:
-        result = subprocess.run([
-            "ffprobe", "-v", "error", "-show_entries",
-            "format=duration", "-of",
-            "default=noprint_wrappers=1:nokey=1", filename
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                filename,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
 
         output = result.stdout.decode().strip()
         return float(output)
@@ -39,54 +64,67 @@ def duration(filename):
         print(f"❌ Failed to get duration for {filename}: {e}")
         return 0.0
 
+
 def get_mps_and_keys(api_url):
     response = requests.get(api_url)
     response_json = response.json()
-    mpd = response_json.get('MPD')
-    keys = response_json.get('KEYS')
+    mpd = response_json.get("MPD")
+    keys = response_json.get("KEYS")
     return mpd, keys
-   
+
+
 def exec(cmd):
-        process = subprocess.run(cmd, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        output = process.stdout.decode()
-        print(output)
-        return output
-        #err = process.stdout.decode()
+    process = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    output = process.stdout.decode()
+    print(output)
+    return output
+
+
 def pull_run(work, cmds):
     with concurrent.futures.ThreadPoolExecutor(max_workers=work) as executor:
         print("Waiting for tasks to complete")
-        fut = executor.map(exec,cmds)
-async def aio(url,name):
-    k = f'{name}.pdf'
+        fut = executor.map(exec, cmds)
+
+
+async def aio(url, name):
+    clean_name = sanitize_filename(name)
+    k = f"{clean_name}.pdf"
+    encoded_url = urllib.parse.quote(url, safe=":/?=&-_~%")
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.get(encoded_url) as resp:
             if resp.status == 200:
-                f = await aiofiles.open(k, mode='wb')
+                f = await aiofiles.open(k, mode="wb")
                 await f.write(await resp.read())
                 await f.close()
     return k
 
 
-async def download(url,name):
-    ka = f'{name}.pdf'
+async def download(url, name):
+    clean_name = sanitize_filename(name)
+    ka = f"{clean_name}.pdf"
+    encoded_url = urllib.parse.quote(url, safe=":/?=&-_~%")
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.get(encoded_url) as resp:
             if resp.status == 200:
-                f = await aiofiles.open(ka, mode='wb')
+                f = await aiofiles.open(ka, mode="wb")
                 await f.write(await resp.read())
                 await f.close()
     return ka
 
+
 async def pdf_download(url, file_name, chunk_size=1024 * 10):
     if os.path.exists(file_name):
         os.remove(file_name)
-    r = requests.get(url, allow_redirects=True, stream=True)
-    with open(file_name, 'wb') as fd:
+    encoded_url = urllib.parse.quote(url, safe=":/?=&-_~%")
+    r = requests.get(encoded_url, allow_redirects=True, stream=True)
+    with open(file_name, "wb") as fd:
         for chunk in r.iter_content(chunk_size=chunk_size):
             if chunk:
                 fd.write(chunk)
-    return file_name   
-   
+    return file_name
+
 
 def parse_vid_info(info):
     info = info.strip()
@@ -95,13 +133,17 @@ def parse_vid_info(info):
     temp = []
     for i in info:
         i = str(i)
-        if "[" not in i and '---' not in i:
+        if "[" not in i and "---" not in i:
             while "  " in i:
                 i = i.replace("  ", " ")
             i.strip()
-            i = i.split("|")[0].split(" ",2)
+            i = i.split("|")[0].split(" ", 2)
             try:
-                if "RESOLUTION" not in i[2] and i[2] not in temp and "audio" not in i[2]:
+                if (
+                    "RESOLUTION" not in i[2]
+                    and i[2] not in temp
+                    and "audio" not in i[2]
+                ):
                     temp.append(i[2])
                     new_info.append((i[0], i[2]))
             except:
@@ -116,31 +158,27 @@ def vid_info(info):
     temp = []
     for i in info:
         i = str(i)
-        if "[" not in i and '---' not in i:
+        if "[" not in i and "---" not in i:
             while "  " in i:
                 i = i.replace("  ", " ")
             i.strip()
-            i = i.split("|")[0].split(" ",3)
+            i = i.split("|")[0].split(" ", 3)
             try:
-                if "RESOLUTION" not in i[2] and i[2] not in temp and "audio" not in i[2]:
+                if (
+                    "RESOLUTION" not in i[2]
+                    and i[2] not in temp
+                    and "audio" not in i[2]
+                ):
                     temp.append(i[2])
-                    
-                    # temp.update(f'{i[2]}')
-                    # new_info.append((i[2], i[0]))
-                    #  mp4,mkv etc ==== f"({i[1]})" 
-                    
-                    new_info.update({f'{i[2]}':f'{i[0]}'})
-
+                    new_info.update({f"{i[2]}": f"{i[0]}"})
             except:
                 pass
     return new_info
 
 
-import os
-import subprocess
-from pathlib import Path
-
-async def decrypt_and_merge_video(mpd_url, keys_string, output_path, output_name, quality="720"):
+async def decrypt_and_merge_video(
+    mpd_url, keys_string, output_path, output_name, quality="720"
+):
     try:
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -160,21 +198,33 @@ async def decrypt_and_merge_video(mpd_url, keys_string, output_path, output_name
                 audio_file = f
 
         if not video_file or not audio_file:
-            raise FileNotFoundError("❌ Decryption failed: video or audio file not found.")
+            raise FileNotFoundError(
+                "❌ Decryption failed: video or audio file not found."
+            )
 
         # Step 3: Decrypt
         decrypted_video = output_path / "video.mp4"
         decrypted_audio = output_path / "audio.m4a"
 
-        subprocess.run(f'mp4decrypt {keys_string} "{video_file}" "{decrypted_video}"', shell=True)
-        subprocess.run(f'mp4decrypt {keys_string} "{audio_file}" "{decrypted_audio}"', shell=True)
+        subprocess.run(
+            f'mp4decrypt {keys_string} "{video_file}" "{decrypted_video}"',
+            shell=True,
+        )
+        subprocess.run(
+            f'mp4decrypt {keys_string} "{audio_file}" "{decrypted_audio}"',
+            shell=True,
+        )
 
         video_file.unlink(missing_ok=True)
         audio_file.unlink(missing_ok=True)
 
         # Step 4: Merge
         final_file = output_path / f"{output_name}.mp4"
-        subprocess.run(f'ffmpeg -y -i "{decrypted_video}" -i "{decrypted_audio}" -c copy "{final_file}"', shell=True)
+        subprocess.run(
+            f'ffmpeg -y -i "{decrypted_video}" -i "{decrypted_audio}" -c copy'
+            f' "{final_file}"',
+            shell=True,
+        )
 
         decrypted_video.unlink(missing_ok=True)
         decrypted_audio.unlink(missing_ok=True)
@@ -189,48 +239,40 @@ async def decrypt_and_merge_video(mpd_url, keys_string, output_path, output_name
         print(f"🔥 Error in decrypt_and_merge_video: {e}")
         return None
 
+
 async def run(cmd):
     proc = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE)
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
 
     stdout, stderr = await proc.communicate()
 
-    print(f'[{cmd!r} exited with {proc.returncode}]')
+    print(f"[{cmd!r} exited with {proc.returncode}]")
     if proc.returncode == 1:
         return False
     if stdout:
-        return f'[stdout]\n{stdout.decode()}'
+        return f"[stdout]\n{stdout.decode()}"
     if stderr:
-        return f'[stderr]\n{stderr.decode()}'
+        return f"[stderr]\n{stderr.decode()}"
 
-    
 
-def old_download(url, file_name, chunk_size = 1024 * 10):
+def old_download(url, file_name, chunk_size=1024 * 10):
     if os.path.exists(file_name):
         os.remove(file_name)
-    r = requests.get(url, allow_redirects=True, stream=True)
-    with open(file_name, 'wb') as fd:
+    encoded_url = urllib.parse.quote(url, safe=":/?=&-_~%")
+    r = requests.get(encoded_url, allow_redirects=True, stream=True)
+    with open(file_name, "wb") as fd:
         for chunk in r.iter_content(chunk_size=chunk_size):
             if chunk:
                 fd.write(chunk)
     return file_name
 
-# appx zip ke liye 
-# helper.py
-import os
-import requests
-import zipfile
-import subprocess
-import tempfile
-import shutil
 
 FIXED_REFERER = "https://player.akamai.net.in/"
 
+
 def process_zip_to_video(url, name):
     temp_dir = tempfile.mkdtemp(prefix="zip_")
-
     zip_path = os.path.join(temp_dir, "file.zip")
     extract_dir = os.path.join(temp_dir, "extract")
     output_path = os.path.join(temp_dir, f"{name}.mp4")
@@ -238,7 +280,7 @@ def process_zip_to_video(url, name):
     headers = {
         "User-Agent": "Mozilla/5.0 (Android)",
         "Referer": FIXED_REFERER,
-        "Range": "bytes=0-"
+        "Range": "bytes=0-",
     }
 
     # 1️⃣ ZIP DOWNLOAD (FIXED REFERER)
@@ -270,20 +312,20 @@ def process_zip_to_video(url, name):
     cmd = [
         "ffmpeg",
         "-y",
-        "-headers", f"Referer: {FIXED_REFERER}\r\n",
-        "-allowed_extensions", "ALL",
-        "-i", m3u8_path,
-        "-c", "copy",
-        output_path
+        "-headers",
+        f"Referer: {FIXED_REFERER}\r\n",
+        "-allowed_extensions",
+        "ALL",
+        "-i",
+        m3u8_path,
+        "-c",
+        "copy",
+        output_path,
     ]
 
     subprocess.run(cmd)
-
     return output_path, temp_dir
 
-import os, requests, zipfile, subprocess
-
-import zipfile
 
 def extract_zip(zip_path: str) -> str:
     extract_dir = zip_path.replace(".zip", "")
@@ -295,12 +337,9 @@ def extract_zip(zip_path: str) -> str:
     return extract_dir
 
 
-import subprocess
-
 def merge_ts_files(folder: str, output: str):
     ts_files = sorted(
-        f for f in os.listdir(folder)
-        if f.endswith((".ts", ".tse"))
+        f for f in os.listdir(folder) if f.endswith((".ts", ".tse"))
     )
 
     list_file = os.path.join(folder, "list.txt")
@@ -308,25 +347,51 @@ def merge_ts_files(folder: str, output: str):
         for ts in ts_files:
             f.write(f"file '{os.path.join(folder, ts)}'\n")
 
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c", "copy",
-        output
-    ], check=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_file,
+            "-c",
+            "copy",
+            output,
+        ],
+        check=True,
+    )
 
     return output
 
 
-def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
+def create_session():
+    session = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(
+        max_retries=retries, pool_connections=10, pool_maxsize=10
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def download_raw_file(
+    url: str, filename: str, ext: str = "mkv"
+) -> str | None:
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
         "Referer": "https://akstechnicalclasses.classx.co.in/",
         "Origin": "https://akstechnicalclasses.classx.co.in",
         "Accept": "*/*",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
     }
 
     os.makedirs("downloads", exist_ok=True)
@@ -340,7 +405,9 @@ def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
         headers["Range"] = f"bytes={downloaded}-"
 
     try:
-        with session.get(url, headers=headers, stream=True, timeout=(10, 180)) as r:
+        with session.get(
+            url, headers=headers, stream=True, timeout=(10, 180)
+        ) as r:
             if r.status_code not in (200, 206):
                 print(f"❌ Bad status: {r.status_code}")
                 return None
@@ -348,14 +415,17 @@ def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
             total = int(r.headers.get("content-length", 0)) + downloaded
             chunk_size = 256 * 1024
 
-            with open(file_path, "ab") as f, tqdm(
-                total=total,
-                initial=downloaded,
-                unit="B",
-                unit_scale=True,
-                desc=filename,
-                ncols=80
-            ) as bar:
+            with (
+                open(file_path, "ab") as f,
+                tqdm(
+                    total=total,
+                    initial=downloaded,
+                    unit="B",
+                    unit_scale=True,
+                    desc=filename,
+                    ncols=80,
+                ) as bar,
+            ):
                 for chunk in r.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
@@ -367,25 +437,22 @@ def download_drago_mkv(url: str, filename: str, ext: str) -> str | None:
         print(f"⚠️ Download interrupted (resume enabled): {e}")
         return file_path if os.path.exists(file_path) else None
 
-def download_drago_mkv(url: str, name: str) -> str | None:
 
-    # 🔹 resolve redirect
+def download_drago_mkv(url: str, name: str) -> str | None:
     r = requests.get(url, allow_redirects=True, timeout=15)
     final_url = r.url
 
-    # 🔹 ZIP case
     if final_url.endswith(".zip"):
         zip_path = download_raw_file(final_url, name, "zip")
         folder = extract_zip(zip_path)
         return merge_ts_files(folder, f"downloads/{name}.mp4")
-
-    # 🔹 MKV (encrypted) case
     else:
         return download_raw_file(final_url, name, "mkv")
-    
+
+
 def human_readable_size(size, decimal_places=2):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
-        if size < 1024.0 or unit == 'PB':
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+        if size < 1024.0 or unit == "PB":
             break
         size /= 1024.0
     return f"{size:.{decimal_places}f} {unit}"
@@ -397,34 +464,60 @@ def time_name():
     current_time = now.strftime("%H%M%S")
     return f"{date} {current_time}.mp4"
 
-import os, re, asyncio, aiohttp
-from urllib.parse import urljoin
 
-async def fetch_segment(session, seg_url, headers):
-    async with session.get(seg_url, headers=headers, timeout=30) as resp:
-        resp.raise_for_status()
-        return await resp.read()
+def decrypt_file(file_path: str, key: str) -> bool:
+    if not file_path or not os.path.exists(file_path):
+        return False
 
-import aiohttp
-import asyncio
-import os
-from urllib.parse import urljoin
+    if not key:
+        return True
+
+    key_bytes = key.encode()
+    size = min(28, os.path.getsize(file_path))
+
+    with open(file_path, "r+b") as f:
+        with mmap.mmap(f.fileno(), length=size, access=mmap.ACCESS_WRITE) as mm:
+            for i in range(size):
+                mm[i] ^= key_bytes[i] if i < len(key_bytes) else i
+
+    return True
+
+
+def download_and_decrypt_video(
+    url: str, name: str, key: str = None
+) -> str | None:
+    video_path = None
+
+    for _ in range(5):
+        video_path = download_raw_file(url, name)
+        if video_path and os.path.getsize(video_path) > 10 * 1024 * 1024:
+            break
+
+    if not video_path:
+        return None
+
+    if decrypt_file(video_path, key):
+        return video_path
+
+    return None
+
 
 async def fetch_segment(session, seg_url, f):
     async with session.get(seg_url) as resp:
         resp.raise_for_status()
         while True:
-            chunk = await resp.content.read(1024*1024)
+            chunk = await resp.content.read(1024 * 1024)
             if not chunk:
                 break
             f.write(chunk)
+
 
 async def download_m3u8_async(url: str, filename: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
         "Referer": "https://player.akamai.net.in/",
         "Origin": "https://player.akamai.net.in",
-        "Accept": "*/*"
+        "Accept": "*/*",
     }
     os.makedirs("downloads", exist_ok=True)
     final_file = f"downloads/{filename}.mp4"
@@ -433,7 +526,11 @@ async def download_m3u8_async(url: str, filename: str):
         r = await session.get(url)
         text = await r.text()
         playlist_lines = text.splitlines()
-        segments = [urljoin(url, line) for line in playlist_lines if line and not line.startswith("#")]
+        segments = [
+            urljoin(url, line)
+            for line in playlist_lines
+            if line and not line.startswith("#")
+        ]
 
         if not segments:
             print("❌ No segments found!")
@@ -448,20 +545,66 @@ async def download_m3u8_async(url: str, filename: str):
         print(f"\n✅ Full video downloaded: {final_file}")
         return final_file
 
-# Run
-# asyncio.run(download_m3u8_async("your_m3u8_url", "video_name"))
-import os
-import asyncio
-import subprocess
-import logging
+
+# ==============================
+# DIRECT MP4 CDN DOWNLOAD METHOD
+# ==============================
+async def download_direct_mp4(url: str, name: str) -> str:
+    clean_name = sanitize_filename(name)
+    output_file = f"{clean_name}.mp4"
+    encoded_url = urllib.parse.quote(url, safe=":/?=&-_~%")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+
+    # 1. First attempt using aria2c
+    aria2_cmd = f'aria2c -c -x 8 -s 8 -j 4 --header="User-Agent: {headers["User-Agent"]}" "{encoded_url}" -o "{output_file}"'
+    proc = await asyncio.create_subprocess_shell(
+        aria2_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+        return output_file
+
+    # 2. Fallback to requests streaming if aria2c fails
+    session = create_session()
+    with session.get(
+        encoded_url, headers=headers, stream=True, timeout=(10, 180)
+    ) as r:
+        r.raise_for_status()
+        with open(output_file, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+    return output_file
+
 
 async def download_video(url, cmd, name):
-    if "transcoded" in url.lower():
-        print(f"⚡ Transcoded URL detected → using download_m3u8 for {name}")
-        return download_m3u8(url, name)
-    
-    download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32"'
     global failed_counter
+    clean_name = sanitize_filename(name)
+
+    # ⚡ Check for direct MP4 links from TXT list
+    if url.endswith(".mp4") or ".mp4" in url.lower():
+        print(f"🎬 Direct MP4 stream detected: {clean_name}")
+        return await download_direct_mp4(url, clean_name)
+
+    if "transcoded" in url.lower():
+        print(
+            f"⚡ Transcoded URL detected → using download_m3u8 for {clean_name}"
+        )
+        return await download_m3u8_async(url, clean_name)
+
+    download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32"'
     print(download_cmd)
     logging.info(download_cmd)
 
@@ -480,7 +623,7 @@ async def download_video(url, cmd, name):
         elif os.path.isfile(f"{name}.webm"):
             return f"{name}.webm"
 
-        base = name.split(".")[0]
+        base = clean_name.split(".")[0]
 
         if os.path.isfile(f"{base}.mkv"):
             return f"{base}.mkv"
@@ -493,177 +636,27 @@ async def download_video(url, cmd, name):
 
     except FileNotFoundError:
         return os.path.splitext(name)[0] + ".mp4"
-import os
-import os
-import time
-import mmap
-import asyncio
-import requests
-import subprocess
-
-from tqdm import tqdm
-from pyrogram import Client
-from pyrogram.types import Message
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import requests
-import os
-from tqdm import tqdm
-import os
-import requests
-from tqdm import tqdm  # progress bar
-def create_session():
-    session = requests.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(
-        max_retries=retries,
-        pool_connections=10,
-        pool_maxsize=10
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-import os
-import mmap
-import requests
-from tqdm import tqdm
-from base64 import b64decode
-
-# ==============================
-# FILE DECRYPT FUNCTION
-# ==============================
-def decrypt_file(file_path: str, key: str) -> bool:
-    if not file_path or not os.path.exists(file_path):
-        return False
-
-    if not key:
-        return True
-
-    key_bytes = key.encode()
-    size = min(28, os.path.getsize(file_path))
-
-    with open(file_path, "r+b") as f:
-        with mmap.mmap(f.fileno(), length=size, access=mmap.ACCESS_WRITE) as mm:
-            for i in range(size):
-                mm[i] ^= key_bytes[i] if i < len(key_bytes) else i
-
-    return True
-# ==============================
-# RAW FILE DOWNLOAD
-# ==============================
-def download_raw_file(url: str, filename: str) -> str | None:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13)",
-        "Referer": "https://akstechnicalclasses.classx.co.in/",
-        "Origin": "https://akstechnicalclasses.classx.co.in",
-        "Accept": "*/*",
-        "Connection": "keep-alive"
-    }
-
-    os.makedirs("downloads", exist_ok=True)
-    file_path = f"downloads/{filename}.mkv"
-
-    session = create_session()
-    downloaded = 0
-
-    if os.path.exists(file_path):
-        downloaded = os.path.getsize(file_path)
-        headers["Range"] = f"bytes={downloaded}-"
-
-    try:
-        with session.get(url, headers=headers, stream=True, timeout=(10, 180)) as r:
-            if r.status_code not in (200, 206):
-                print(f"❌ Bad status: {r.status_code}")
-                return None
-
-            total = int(r.headers.get("content-length", 0)) + downloaded
-            chunk_size = 256 * 1024
-
-            with open(file_path, "ab") as f, tqdm(
-                total=total,
-                initial=downloaded,
-                unit="B",
-                unit_scale=True,
-                desc=filename,
-                ncols=80
-            ) as bar:
-                for chunk in r.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        bar.update(len(chunk))
-
-        return file_path
-
-    except Exception as e:
-        print(f"⚠️ Download interrupted (resume enabled): {e}")
-        return file_path if os.path.exists(file_path) else None
-# ==============================
-# DOWNLOAD + DECRYPT WRAPPER
-# ==============================
-
-def download_and_decrypt_video(url: str, name: str, key: str = None) -> str | None:
-    video_path = None
-
-    for _ in range(5):  # resume attempts
-        video_path = download_raw_file(url, name)
-        if video_path and os.path.getsize(video_path) > 10 * 1024 * 1024:
-            break
-
-    if not video_path:
-        return None
-
-    if decrypt_file(video_path, key):
-        return video_path
-
-    return None
-
-# ==============================
-# EXAMPLE USAGE
-# ==============================
 
 
-async def send_doc(bot: Client, m: Message, cc, ka, cc1, prog, count, name, channel_id):
-    reply = await bot.send_message(channel_id, f"Downloading pdf:\n<pre><code>{name}</code></pre>")
-    time.sleep(1)
-    start_time = time.time()
-    await bot.send_document(ka, caption=cc1)
-    count+=1
-    await reply.delete (True)
-    time.sleep(1)
-    os.remove(ka)
-    time.sleep(3) 
-
-
-
-import asyncio
-
-import asyncio
-
-import asyncio
-
-import os
-
-
-
-
-    
-import os
-import time
-import asyncio
-
-# 🔹 Async ffmpeg runner (NO BLOCKING)
 async def run_cmd(cmd: str):
     process = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL
+        cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
     )
     await process.communicate()
+
+
+async def send_doc(
+    bot: Client, m: Message, cc, ka, cc1, prog, count, name, channel_id
+):
+    reply = await bot.send_message(
+        channel_id, f"Downloading pdf:\n<pre><code>{name}</code></pre>"
+    )
+    try:
+        await bot.send_document(channel_id, ka, caption=cc1)
+    finally:
+        await reply.delete(True)
+        if os.path.exists(ka):
+            os.remove(ka)
 
 
 async def send_vid(
@@ -675,52 +668,56 @@ async def send_vid(
     thumb,
     name,
     prog,
-    channel_id
+    channel_id,
 ):
-    # ==========================
-    # THUMBNAIL GENERATION
-    # ==========================
+    clean_name = sanitize_filename(name)
     thumb_path = f"{filename}.jpg"
+
+    # THUMBNAIL GENERATION
     await run_cmd(
         f'ffmpeg -y -i "{filename}" -ss 00:00:10 -vframes 1 "{thumb_path}"'
     )
 
-    await prog.delete(True)
+    if prog:
+        try:
+            await prog.delete(True)
+        except Exception:
+            pass
 
     reply1 = await bot.send_message(
         channel_id,
-        f"**📩 Uploading Video 📩:-**\n<blockquote>**{name}**</blockquote>"
+        f"**📩 Uploading Video 📩:-**\n<blockquote>**{clean_name}**</blockquote>",
     )
 
     reply = await m.reply_text(
-        f"**Generate Thumbnail:**\n<blockquote>**{name}**</blockquote>"
+        f"**Generate Thumbnail:**\n<blockquote>**{clean_name}**</blockquote>"
     )
 
-    # ==========================
     # THUMB SELECTION
-    # ==========================
-    thumbnail = thumb_path if thumb == "/d" else thumb
+    thumbnail = (
+        thumb_path
+        if (thumb == "/d" or not thumb)
+        else (thumb if os.path.exists(thumb) else thumb_path)
+    )
 
-    # ==========================
     # WATERMARK PROCESS
-    # ==========================
-    if vidwatermark == "/d":
+    if vidwatermark == "/d" or not vidwatermark:
         w_filename = filename
     else:
         w_filename = f"w_{os.path.basename(filename)}"
-        font_path = "vidwater.ttf"
+        font_path = "vidwater.ttf"[cite: 2]
 
-        await run_cmd(
-            f'ffmpeg -y -i "{filename}" -vf '
-            f'"drawtext=fontfile={font_path}:text=\'{vidwatermark}\':'
-            f'fontcolor=white@0.3:fontsize=h/6:'
-            f'x=(w-text_w)/2:y=(h-text_h)/2" '
-            f'-codec:a copy "{w_filename}"'
-        )
+        if os.path.exists(font_path):
+            await run_cmd(
+                f'ffmpeg -y -i "{filename}" -vf '
+                f'"drawtext=fontfile={font_path}:text=\'{vidwatermark}\':'
+                f"fontcolor=white@0.3:fontsize=h/6:"
+                f'x=(w-text_w)/2:y=(h-text_h)/2" '
+                f'-codec:a copy "{w_filename}"'
+            )
+        else:
+            w_filename = filename
 
-    # ==========================
-    # SAFETY CHECK
-    # ==========================
     if not os.path.exists(w_filename):
         await m.reply_text("❌ Video processing failed")
         return
@@ -728,9 +725,7 @@ async def send_vid(
     dur = int(duration(w_filename))
     start_time = time.time()
 
-    # ==========================
-    # UPLOAD (VIDEO → DOC FALLBACK)
-    # ==========================
+    # UPLOAD (VIDEO -> DOC FALLBACK)
     try:
         await bot.send_video(
             chat_id=channel_id,
@@ -739,10 +734,10 @@ async def send_vid(
             supports_streaming=True,
             height=720,
             width=1280,
-            thumb=thumbnail,
+            thumb=thumbnail if os.path.exists(thumbnail) else None,
             duration=dur,
             progress=progress_bar,
-            progress_args=(reply, start_time)
+            progress_args=(reply, start_time),
         )
     except Exception:
         await bot.send_document(
@@ -750,16 +745,18 @@ async def send_vid(
             document=w_filename,
             caption=cc,
             progress=progress_bar,
-            progress_args=(reply, start_time)
+            progress_args=(reply, start_time),
         )
-
-    # ==========================
-    # CLEANUP
-    # ==========================
-    
-    except Exception:
-        await bot.send_document(channel_id, w_filename, caption=cc, progress=progress_bar, progress_args=(reply, start_time))
-    os.remove(w_filename)
-    await reply.delete(True)
-    await reply1.delete(True)
-    os.remove(f"{filename}.jpg")
+    finally:
+        # CLEANUP
+        if os.path.exists(w_filename):
+            os.remove(w_filename)
+        if w_filename != filename and os.path.exists(filename):
+            os.remove(filename)
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+        try:
+            await reply.delete(True)
+            await reply1.delete(True)
+        except Exception:
+            pass
