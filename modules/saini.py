@@ -644,11 +644,20 @@ async def run_cmd(cmd: str):
 async def send_doc(
     bot: Client, m: Message, cc, ka, cc1, prog, count, name, channel_id
 ):
+    clean_name = sanitize_filename(name)
+    
+    # Use cc1 if provided, otherwise fallback to filename
+    caption_text = cc1 if (cc1 and cc1 != "/d") else f"**{clean_name}**"
+
     reply = await bot.send_message(
-        channel_id, f"Downloading pdf:\n<pre><code>{name}</code></pre>"
+        channel_id, f"Downloading pdf:\n<pre><code>{clean_name}</code></pre>"
     )
     try:
-        await bot.send_document(channel_id, ka, caption=cc1)
+        await bot.send_document(
+            chat_id=channel_id,
+            document=ka,
+            caption=caption_text
+        )
     finally:
         await reply.delete(True)
         if os.path.exists(ka):
@@ -701,7 +710,7 @@ async def send_vid(
         w_filename = filename
     else:
         w_filename = f"w_{os.path.basename(filename)}"
-        font_path = "vidwater.ttf"[cite: 2]
+        font_path = "vidwater.ttf"
 
         if os.path.exists(font_path):
             await run_cmd(
@@ -721,12 +730,15 @@ async def send_vid(
     dur = int(duration(w_filename))
     start_time = time.time()
 
+    # Use cc / cc1 if provided, otherwise fallback to filename
+    caption_text = cc if (cc and cc != "/d") else f"**{clean_name}**"
+
     # UPLOAD (VIDEO -> DOC FALLBACK)
     try:
         await bot.send_video(
             chat_id=channel_id,
             video=w_filename,
-            caption=cc,
+            caption=caption_text,
             supports_streaming=True,
             height=720,
             width=1280,
@@ -739,7 +751,7 @@ async def send_vid(
         await bot.send_document(
             chat_id=channel_id,
             document=w_filename,
-            caption=cc,
+            caption=caption_text,
             progress=progress_bar,
             progress_args=(reply, start_time),
         )
