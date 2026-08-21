@@ -34,6 +34,9 @@ failed_counter = 0
 
 
 def sanitize_filename(name: str) -> str:
+    # Remove extension if already present to prevent double extensions
+    name = re.sub(r'\.(mp4|pdf|mkv|webm)$', '', name, flags=re.IGNORECASE)
+    # Strip illegal characters
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
 
@@ -183,12 +186,10 @@ async def decrypt_and_merge_video(
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Step 1: Download with yt-dlp
         cmd1 = f'yt-dlp -f "bv[height<={quality}]+ba/b" -o "{output_path}/file.%(ext)s" --allow-unplayable-formats --no-check-certificate --external-downloader aria2c "{mpd_url}"'
         print(f"▶️ Downloading: {cmd1}")
         subprocess.run(cmd1, shell=True)
 
-        # Step 2: Detect downloaded files
         video_file = None
         audio_file = None
         for f in output_path.iterdir():
@@ -202,7 +203,6 @@ async def decrypt_and_merge_video(
                 "❌ Decryption failed: video or audio file not found."
             )
 
-        # Step 3: Decrypt
         decrypted_video = output_path / "video.mp4"
         decrypted_audio = output_path / "audio.m4a"
 
@@ -218,7 +218,6 @@ async def decrypt_and_merge_video(
         video_file.unlink(missing_ok=True)
         audio_file.unlink(missing_ok=True)
 
-        # Step 4: Merge
         final_file = output_path / f"{output_name}.mp4"
         subprocess.run(
             f'ffmpeg -y -i "{decrypted_video}" -i "{decrypted_audio}" -c copy'
@@ -283,7 +282,6 @@ def process_zip_to_video(url, name):
         "Range": "bytes=0-",
     }
 
-    # 1️⃣ ZIP DOWNLOAD (FIXED REFERER)
     with requests.get(url, headers=headers, stream=True, timeout=20) as r:
         r.raise_for_status()
         with open(zip_path, "wb") as f:
@@ -291,12 +289,10 @@ def process_zip_to_video(url, name):
                 if chunk:
                     f.write(chunk)
 
-    # 2️⃣ EXTRACT ZIP
     os.makedirs(extract_dir, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(extract_dir)
 
-    # 3️⃣ FIND m3u8
     m3u8_path = None
     for root, _, files in os.walk(extract_dir):
         for f in files:
@@ -308,7 +304,6 @@ def process_zip_to_video(url, name):
         shutil.rmtree(temp_dir)
         raise Exception("❌ m3u8 file nahi mili")
 
-    # 4️⃣ m3u8 → MP4 (same referer ffmpeg me bhi)
     cmd = [
         "ffmpeg",
         "-y",
@@ -547,7 +542,7 @@ async def download_m3u8_async(url: str, filename: str):
 
 
 # ==============================
-# DIRECT MP4 CDN DOWNLOAD METHOD
+# DIRECT MP4 DOWNLOAD METHOD
 # ==============================
 async def download_direct_mp4(url: str, name: str) -> str:
     clean_name = sanitize_filename(name)
@@ -594,7 +589,7 @@ async def download_video(url, cmd, name):
     clean_name = sanitize_filename(name)
 
     # ⚡ Check for direct MP4 links from TXT list
-    if url.endswith(".mp4") or ".mp4" in url.lower():
+    if url.strip().endswith(".mp4") or ".mp4" in url.lower():
         print(f"🎬 Direct MP4 stream detected: {clean_name}")
         return await download_direct_mp4(url, clean_name)
 
@@ -604,6 +599,7 @@ async def download_video(url, cmd, name):
         )
         return await download_m3u8_async(url, clean_name)
 
+    # Fallback to general yt-dlp handling
     download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32"'
     print(download_cmd)
     logging.info(download_cmd)
